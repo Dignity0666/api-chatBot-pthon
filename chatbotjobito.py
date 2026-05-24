@@ -22,8 +22,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import psycopg2
 import psycopg2.extras
-from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
-from threading import Thread
 from fastapi.responses import StreamingResponse
 import json
 import base64
@@ -34,16 +32,14 @@ import docx
 
 app = FastAPI(title="Jobito AI Chatbot (Local Generative AI)")
 
-DB_CONFIG = {
-    "host":     os.getenv("DB_HOST", "localhost"),
-    "port":     os.getenv("DB_PORT", "5432"),
-    "dbname":   os.getenv("DB_NAME", "jobito"),
-    "user":     os.getenv("DB_USERNAME", "postgres"),
-    "password": os.getenv("DB_PASSWORD", "mlpoknbv"),
-    "options":  "-c search_path=ptj,public",
-}
-
-print(f"📡 DB Config: Host={DB_CONFIG['host']}, User={DB_CONFIG['user']}, DB={DB_CONFIG['dbname']}, Pass={'***' if DB_CONFIG['password'] else 'MISSING'}")
+DB_URL = os.getenv("DATABASE_URL")
+if not DB_URL:
+    print("⚠️ DATABASE_URL NOT FOUND IN .ENV!")
+else:
+    # Fix for psycopg2: remove pgbouncer=true from URI
+    if "pgbouncer=true" in DB_URL:
+        DB_URL = DB_URL.replace("pgbouncer=true", "").replace("?&", "?").replace("&&", "&").strip("?&")
+    print("📡 Database URL loaded successfully.")
 
 
 NESTJS_MONITORING_URL = os.getenv("NESTJS_MONITORING_URL", "http://localhost:3000/monitoring/log")
@@ -60,26 +56,14 @@ async def report_to_bam(message: str, metadata: Dict = None):
         pass
 
 def get_connection():
-    return psycopg2.connect(**DB_CONFIG)
+    return psycopg2.connect(DB_URL, options="-c search_path=ptj,public")
 
 
-print("جاري تحميل نموذج النصوص الذكي (Qwen2.5)...")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+print("✅ تم إعداد Groq API للرد بدلاً من النموذج المحلي.")
 
-try:
-    # Use 0.5B model instead of 1.5B for better performance on consumer hardware
-    model_id = "Qwen/Qwen2.5-0.5B-Instruct" 
-    print(f"🔄 Downloading/Loading model: {model_id}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id).to("cpu").eval()
-    print("✅ تم تحميل نموذج النصوص بنجاح! السيرفر جاهز.")
-except Exception as e:
-    print(f"❌ فشل تحميل النموذج: {e}")
-    model = None
-    tokenizer = None
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATABASE CONNECTION TEST
-# ═══════════════════════════════════════════════════════════════════════════════
+
 def test_connections():
     # PostgreSQL Test
     try:
@@ -96,7 +80,6 @@ test_connections()
 # CONTEXT RETRIEVAL (RAG) & MEMORY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Removed in-memory chat_memory, using MongoDB instead
 
 def get_db_context(user_msg: str) -> str:
     """Intelligently decides what to fetch from DB based on intent."""
@@ -193,14 +176,8 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    if not model or not tokenizer:
-        return StreamingResponse(iter([f"data: {json.dumps({'text': 'عذراً، نظام الذكاء الاصطناعي غير جاهز حالياً (فشل تحميل النموذج). يرجى التأكد من الاتصال بالإنترنت.'})}\n\n", "data: [DONE]\n\n"]), media_type="text/event-stream")
-
     if not request.message and not request.image:
         raise HTTPException(status_code=400, detail="Empty request")
-    
-    if not model or not tokenizer:
-        raise HTTPException(status_code=500, detail="عذراً، نظام الذكاء الاصطناعي المحلي غير متاح حالياً.")
 
     user_id = request.user_id or "guest"
     user_msg = request.message
@@ -241,47 +218,59 @@ async def chat(request: ChatRequest):
                  "يمكنك تغيير ألوان الواجهة إذا طلب المستخدم ذلك عن طريق كتابة [THEME: color_name] في نهاية ردك.\n" \
                  "الألوان المتاحة: (dark, blue, purple, green, gold)."
 
-    # 3. Generate Response
-    def generate_chunks():
+    if db_context:
+        sys_prompt += f"\n\nمعلومات إضافية للمساعدة في الإجابة:\n{db_context}"
+
+    async def generate_chunks():
+        messages = [{"role": "system", "content": sys_prompt}]
+        for msg in history[-5:]:
+            role = "assistant" if msg.get("role") == "assistant" else "user"
+            messages.append({"role": role, "content": msg.get("content", "")})
+        
+        user_content = user_msg or ""
+        if extracted_text:
+            user_content += f"\n\n[محتوى الملف المستخرج]:\n{extracted_text}"
+            
+        messages.append({"role": "user", "content": user_content})
+
         try:
-            # Proper Qwen ChatML format
-            full_prompt = f"<|im_start|>system\n{sys_prompt}<|im_end|>\n"
-            for msg in history[-5:]:
-                role = "assistant" if msg["role"] == "assistant" else "user"
-                full_prompt += f"<|im_start|>{role}\n{msg['content']}<|im_end|>\n"
-            full_prompt += f"<|im_start|>user\n{user_msg}<|im_end|>\n<|im_start|>assistant\n"
-            
-            model_inputs = tokenizer([full_prompt], return_tensors="pt").to(model.device)
-            streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-            generation_kwargs = dict(model_inputs, streamer=streamer, max_new_tokens=512)
-            
-            thread = Thread(target=model.generate, kwargs=generation_kwargs)
-            thread.start()
-            
-            # Add explicit stop strings to prevent token leaks
-            stop_tokens = ["<|im_end|>", "<|user|>", "<|im_start|>"]
-            
-            # Use a specialized streamer or check for stop strings in chunks
-            for new_text in streamer:
-                if new_text:
-                    # Break if any stop token appears in the stream
-                    if any(stop in new_text for stop in stop_tokens):
-                        break
-                        
-                    clean_text = new_text
-                    # Aggressive Filtering for partial technical tokens
-                    forbidden = ["<|im_start|>", "<|im_end|>", "<|user|>", "<|assistant|>", "<|system|>", "im_start", "im_end"]
-                    for token in forbidden:
-                        clean_text = clean_text.replace(token, "")
-                    
-                    if clean_text.strip() or " " in new_text:
-                        yield f"data: {json.dumps({'text': clean_text})}\n\n"
-            
-            yield "data: [DONE]\n\n"
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "llama-3.3-70b-versatile",
+                        "messages": messages,
+                        "stream": True,
+                        "temperature": 0.6,
+                        "max_completion_tokens": 1024
+                    },
+                    timeout=30.0
+                )
+                
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            if "choices" in data and len(data["choices"]) > 0:
+                                delta = data["choices"][0].get("delta", {})
+                                if "content" in delta and delta["content"]:
+                                    yield f"data: {json.dumps({'text': delta['content']})}\n\n"
+                        except Exception:
+                            pass
+                            
+                yield "data: [DONE]\n\n"
         except Exception as e:
-            print(f"Generation error: {e}")
-            yield f"data: {json.dumps({'text': 'عذراً، واجهت مشكلة في معالجة طلبك.'})}\n\n"
+            print(f"CRITICAL: Unexpected error in generate_chunks: {e}")
+            yield f"data: {json.dumps({'text': '⚠️ عذراً، حدث خطأ أثناء الاتصال بـ Groq.'})}\n\n"
             yield "data: [DONE]\n\n"
+
 
     return StreamingResponse(generate_chunks(), media_type="text/event-stream")
 
