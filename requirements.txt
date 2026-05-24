@@ -8,3 +8,4 @@ Pillow
 einops
 pymupdf
 python-docx
+python-dotenv
