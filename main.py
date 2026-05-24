@@ -19,6 +19,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg2
 import psycopg2.extras
@@ -31,6 +32,19 @@ import fitz # PyMuPDF
 import docx
 
 app = FastAPI(title="Jobito AI Chatbot (Local Generative AI)")
+
+# Enable CORS to allow requests from the Frontend and Backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+def read_root():
+    return {"status": "success", "message": "Jobito Chatbot API is running perfectly!"}
 
 DB_URL = os.getenv("DATABASE_URL")
 if not DB_URL:
